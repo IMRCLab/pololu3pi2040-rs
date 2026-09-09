@@ -13,6 +13,13 @@ ROS/install/
 ROS/log/
 ROS/.ros/
 
+# Accidental/legacy Colcon workspace at the repository root.  The maintained
+# workspace lives under ROS/, so do not stage its duplicate sources or outputs.
+/src/
+/build/
+/install/
+/log/
+
 # Python
 __pycache__/
 *.pyc

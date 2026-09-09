@@ -11,6 +11,7 @@
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
   <depend>motion_capture_tracking_interfaces</depend>
+  <depend>wmr_interfaces</depend>
 
   <export>
     <build_type>ament_python</build_type>

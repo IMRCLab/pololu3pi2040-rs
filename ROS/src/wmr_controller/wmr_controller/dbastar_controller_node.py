@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
+import copy
+from concurrent.futures import ThreadPoolExecutor
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from geometry_msgs.msg import Twist, Vector3
 from motion_capture_tracking_interfaces.msg import NamedPoseArray
+from wmr_interfaces.msg import AABB2DArray
+from wmr_controller.aabb_utils import (
+    aabb_map_from_messages,
+    compare_aabb_maps,
+    planner_obstacles,
+)
 import numpy as np
 import sys
 import os
@@ -66,21 +75,29 @@ class dbastarControllerNode(Node):
         self.declare_parameter('robot_name', 'Pololu09')
         self.declare_parameter('mocap_topic', '/poses')
         self.declare_parameter('cmd_unicycle_topic', '/cmd_unicycle')
-        self.declare_parameter('control_rate', 10.0)
+        self.declare_parameter('control_dt', 0.1)
         self.declare_parameter('problem', BENCHMARK_FILE)
-        self.declare_parameter('instance', '-1.5_-2.5_-0.7854')
+        self.declare_parameter('instance', '1.3_0.5_2.3562_empty')
+        self.declare_parameter('obstacle_topic', '/obstacles_aabb')
+        self.declare_parameter('obstacle_change_tolerance', 0.02)
 
         self.robot_name = str(self.get_parameter('robot_name').value)
         mocap_topic = str(self.get_parameter('mocap_topic').value)
         cmd_unicycle_topic = str(self.get_parameter('cmd_unicycle_topic').value)
-        frequency = float(self.get_parameter('control_rate').value)
+        control_dt = float(self.get_parameter('control_dt').value)
         problem_path = str(self.get_parameter('problem').value)
         instance_name = str(self.get_parameter('instance').value)
-
-        if frequency <= 0.0:
-            raise ValueError("ROS parameter 'control_rate' must be greater than zero")
+        obstacle_topic = str(self.get_parameter('obstacle_topic').value)
+        self.obstacle_change_tolerance = float(
+            self.get_parameter('obstacle_change_tolerance').value
+        )
+        print(instance_name)
+        if control_dt <= 0.0:
+            raise ValueError("ROS parameter 'control_dt' must be greater than zero")
         if not os.path.isfile(problem_path):
             raise FileNotFoundError(f"Problem file does not exist: {problem_path}")
+        if self.obstacle_change_tolerance < 0.0:
+            raise ValueError("obstacle_change_tolerance must be non-negative")
 
         with open(problem_path, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -107,16 +124,20 @@ class dbastarControllerNode(Node):
             )
         problem = out[instance_name]
         
-        configured_dt = float(problem["dbastar"]["dt"])
-        self.dt = 1.0 / frequency
-        if not np.isclose(self.dt, configured_dt):
-            self.get_logger().warn(
-                f"control_rate={frequency:g} Hz overrides dbastar.dt="
-                f"{configured_dt:g} s with dt={self.dt:g} s"
+        self.trajectory_dt = float(problem["dbastar"]["dt"])
+        if self.trajectory_dt <= 0.0:
+            raise ValueError(
+                "dbastar.dt must be greater than zero"
             )
-            problem["dbastar"]["dt"] = self.dt
+        self.controller_dt = control_dt
+        # if not np.isclose(self.controller_dt, self.trajectory_dt):
+        #     self.get_logger().warn(
+        #         f"control_dt={control_dt:g} Hz overrides dbastar.dt="
+        #         f"{self.trajectory_dt:g} s with dt={self.controller_dt:g} s"
+        #     )
+        #     problem["dbastar"]["dt"] = self.dt
         self.thr = float(problem["dbastar"]["goal_threshold"])
-        self.steps_max = int(problem["sim_time"] / self.dt)
+        self.steps_max = int(problem["sim_time"] / self.controller_dt)
         static = obstacles_of(problem)
         dyn, van = dynamic_obstacles_of(problem), vanishing_obstacles_of(problem)
         self.shoves = list(displacements_of(problem))
@@ -137,10 +158,50 @@ class dbastarControllerNode(Node):
         self.log_wheel_cmd = []
 
         self.get_logger().info("Running planner once")
-        _run_smag_once(self.problem, self.start, self.goal)
-        self.get_logger().info("Planner finished, getting setpoints from csv")
+        result = _run_smag_once(
+            self.problem,
+            self.start,
+            self.goal
+        )
 
-        self.setpoints = _smag_plan()
+        if not result["reached"]:
+            raise RuntimeError(
+                "DBA* failed to generate a valid trajectory"
+            )
+
+        self.t_compute = result["search_time_s"] or 0.0
+        self.setpoints = np.asarray(
+            result["plan"],
+            dtype=float
+        )
+
+        if self.setpoints.size == 0:
+            raise RuntimeError(
+                "DBA* returned an empty trajectory"
+            )
+
+        if self.setpoints.ndim == 1:
+            self.setpoints = self.setpoints.reshape(1, -1)
+
+        if self.setpoints.shape[1] < 6:
+            raise RuntimeError(
+                f"Expected trajectory columns "
+                f"[x, y, theta, vx, vy, w], "
+                f"but got shape {self.setpoints.shape}"
+            )
+
+        if not np.all(np.isfinite(self.setpoints)):
+            raise RuntimeError(
+                "Trajectory contains NaN or infinity"
+            )
+
+        self.get_logger().info(
+            f"Loaded {len(self.setpoints)} setpoints; "
+            f"trajectory_dt={self.trajectory_dt:g} s"
+        )
+
+        # self.setpoints = _smag_plan()
+        print(f"Loaded {len(self.setpoints)} setpoints from planner")
 
         # Robot parameters for pololu robots
         robot_cfg = self.problem["robotcfg"]
@@ -157,13 +218,16 @@ class dbastarControllerNode(Node):
         self.ky = float(dbastar_cfg["ky"])
         self.kth = float(dbastar_cfg["kth"])
         self.get_logger().info(f'Controller gains: kx={self.kx}, ky={self.ky}, kth={self.kth}')
-        controller_gains = [self.kx, self.ky, self.kth, 0.01, 0.01, 0.01, 0.01]  # [kx, ky, kth, kpr, kpl, kir, kil] 
+        # controller_gains = [self.kx, self.ky, self.kth, 0.01, 0.01, 0.01, 0.01]  # [kx, ky, kth, kpr, kpl, kir, kil] 
+        controller_gains = [4.0, 8.0, 3.0, 0.0, 0.0, 0.0, 0.0]  # [kx, ky, kth, kpr, kpl, kir, kil]
         self.wheel_vel_upper_limits = float(robot_cfg.get("max_vel_leftwheel", 30.0))  # load wheel speed limits from benchmark.yaml
         self.wheel_vel_lower_limits = float(robot_cfg.get("min_vel_leftwheel", -30.0))  # load wheel speed limits from benchmark.yaml
         cmd_limits = (self.wheel_vel_lower_limits, self.wheel_vel_upper_limits)  # Wheel speed limits (rad/s) for pololu robots (seems to be lower than actual wheelspeed limits)
         self.controller = Controller(self.robot_param, gains=controller_gains, 
-                                    cmd_limits=cmd_limits, dt=self.dt)
+                                    cmd_limits=cmd_limits, dt=self.controller_dt)
         
+        self.control_step = 0
+        self.reference_index = 0
 
         #init estimator from wmr-simulator
         estimator_cfg = {
@@ -177,7 +241,20 @@ class dbastarControllerNode(Node):
             "proc_pos_std": 0.01,
             "proc_theta_std": 0.01
         }
-        self.estimator = DiffDriveEstimator(estimator_cfg, self.dt)
+        self.estimator = DiffDriveEstimator(estimator_cfg, self.controller_dt)
+
+        # AABB snapshots are reusable ROS inputs.  Planning stays single-threaded
+        # because every SMAG invocation writes the same traj/*.csv files.
+        self.observed_obstacles = {
+            f"yaml_{index}": tuple(box)
+            for index, box in enumerate(obstacles_of(self.problem))
+        }
+        self.replanning = False
+        self.replan_requested = False
+        self.replan_pending_until_pose = False
+        self.replan_future = None
+        self.planning_failed = False
+        self.planner_executor = ThreadPoolExecutor(max_workers=1)
         
 
         # QoS for mocap (BEST_EFFORT like controller_interface)
@@ -201,12 +278,19 @@ class dbastarControllerNode(Node):
             self.poses_callback,
             mocap_qos
         )
+
+        self.obstacle_sub = self.create_subscription(
+            AABB2DArray,
+            obstacle_topic,
+            self.obstacles_callback,
+            mocap_qos
+        )
         
         #publish velocity commands (v, w) on /cmd_unicycle topic 
         self.cmd_pub = self.create_publisher(Vector3, cmd_unicycle_topic, cmd_qos)
         
         # Timer for control loop
-        self.timer = self.create_timer(self.dt, self.control_loop)
+        self.timer = self.create_timer(self.controller_dt, self.control_loop)
         
         # State
         self.latest_pose = None
@@ -214,8 +298,9 @@ class dbastarControllerNode(Node):
         self.wheel_speeds = (0.0, 0.0)  # Estimated wheel speeds (ur, ul)
         
         self.get_logger().info(
-            f'DBA* controller started for robot: {self.robot_name} @ {frequency:g} Hz; '
-            f'mocap={mocap_topic}, cmd={cmd_unicycle_topic}, instance={instance_name}'
+            f'DBA* controller started for robot: {self.robot_name} @ {1.0/self.controller_dt:g} Hz; '
+            f'mocap={mocap_topic}, obstacles={obstacle_topic}, '
+            f'cmd={cmd_unicycle_topic}, instance={instance_name}'
         )
     
 
@@ -242,12 +327,173 @@ class dbastarControllerNode(Node):
                     self.estimator._init_state(x0, y0, th0)
                     self.initialized = True
                     self.get_logger().info(f'Initialized at x={x0:.3f}, y={y0:.3f}, theta={th0:.3f}')
+                    if self.replan_pending_until_pose:
+                        self.replan_pending_until_pose = False
+                        self.get_logger().info(
+                            "Robot pose is now available; starting the pending replan"
+                        )
+                        self.request_replan()
                 break
+
+    def current_robot_pose(self):
+        if self.latest_pose is None:
+            return None
+
+        pose = self.latest_pose
+        q = pose.orientation
+        theta = self.estimator._wrap_to_pi(
+            np.arctan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
+            )
+        )
+        return [float(pose.position.x), float(pose.position.y), float(theta)]
+
+    def obstacles_callback(self, msg: AABB2DArray):
+        """Consume a complete, current AABB snapshot."""
+        try:
+            new_obstacles = aabb_map_from_messages(msg.boxes)
+            changes = compare_aabb_maps(
+                self.observed_obstacles,
+                new_obstacles,
+                self.obstacle_change_tolerance,
+            )
+        except ValueError as error:
+            self.get_logger().warn(f"Ignoring invalid AABB snapshot: {error}")
+            return
+
+        if not changes.changed:
+            return
+
+        self.observed_obstacles = new_obstacles
+        self.get_logger().info(
+            f"AABB map changed: added={list(changes.added)}, "
+            f"removed={list(changes.removed)}, moved={list(changes.moved)}"
+        )
+        if self.initialized:
+            self.request_replan()
+        else:
+            self.replan_pending_until_pose = True
+            self.get_logger().info(
+                "AABB change stored; waiting for the first robot pose before replanning"
+            )
+
+    def validate_plan_result(self, result):
+        if not result.get("reached", False):
+            raise RuntimeError("DBA* failed to generate a valid trajectory")
+
+        setpoints = np.asarray(result.get("plan", []), dtype=float)
+        if setpoints.size == 0:
+            raise RuntimeError("DBA* returned an empty trajectory")
+        if setpoints.ndim == 1:
+            setpoints = setpoints.reshape(1, -1)
+        if setpoints.ndim != 2 or setpoints.shape[1] < 6:
+            raise RuntimeError(
+                "Expected trajectory columns [x, y, theta, vx, vy, w], "
+                f"got shape {setpoints.shape}"
+            )
+        if not np.all(np.isfinite(setpoints)):
+            raise RuntimeError("Trajectory contains NaN or infinity")
+        return setpoints
+
+    def make_replan_problem(self, start):
+        problem = copy.deepcopy(self.problem)
+        problem["start"] = list(start)
+        problem["environment"]["obstacles"] = planner_obstacles(
+            self.observed_obstacles
+        )
+        problem["environment"]["dynamic_obstacles"] = []
+        problem["environment"]["vanishing_obstacles"] = []
+        return problem
+
+    def run_replan(self, problem, start, goal):
+        result = _run_smag_once(problem, start, goal)
+        return {
+            "problem": problem,
+            "start": list(start),
+            "setpoints": self.validate_plan_result(result),
+            "search_time_s": result.get("search_time_s") or 0.0,
+        }
+
+    def request_replan(self):
+        start = self.current_robot_pose()
+        if start is None:
+            self.get_logger().warn("Cannot replan without a robot pose")
+            return
+        if self.replanning:
+            self.replan_requested = True
+            self.get_logger().info(
+                "A replan is already running; queued another replan"
+            )
+            return
+
+        problem = self.make_replan_problem(start)
+        self.replanning = True
+        self.replan_requested = False
+        self.planning_failed = False
+        self.controller.ir = 0.0
+        self.controller.il = 0.0
+        self.wheel_speeds = (0.0, 0.0)
+        self.cmd_pub.publish(Vector3())
+
+        self.get_logger().info(
+            f"Starting DBA* replan from {start} with "
+            f"{len(problem['environment']['obstacles'])} AABBs"
+        )
+        self.replan_future = self.planner_executor.submit(
+            self.run_replan, problem, start, list(self.goal)
+        )
+
+    def update_replanning(self):
+        if not self.replanning:
+            return False
+
+        self.cmd_pub.publish(Vector3())
+        if self.replan_future is None or not self.replan_future.done():
+            return True
+
+        try:
+            replanned = self.replan_future.result()
+        except Exception as error:
+            self.get_logger().error(f"DBA* replanning failed: {error}")
+            self.replanning = False
+            self.replan_future = None
+            self.planning_failed = True
+            return True
+
+        self.problem = replanned["problem"]
+        self.start = replanned["start"]
+        self.setpoints = replanned["setpoints"]
+        self.t_compute += replanned["search_time_s"]
+        self.control_step = 0
+        self.reference_index = 0
+        self.controller.ir = 0.0
+        self.controller.il = 0.0
+        self.wheel_speeds = (0.0, 0.0)
+        self.replanning = False
+        self.replan_future = None
+        self.planning_failed = False
+
+        self.get_logger().info(
+            f"Replanning succeeded; loaded {len(self.setpoints)} setpoints"
+        )
+        if self.replan_requested:
+            self.replan_requested = False
+            self.request_replan()
+        return True
     
     def control_loop(self):
         """copied from simulator.py and adapted to run inside a ros2 node """
+        if self.planning_failed:
+            self.cmd_pub.publish(Vector3())
+            return
+
+        if self.update_replanning():
+            return
+
         if not self.initialized or self.latest_pose is None:
             self.get_logger().warn('Waiting for first mocap pose...', throttle_duration_sec=2.0)
+            self.cmd_pub.publish(Vector3())
             return
         
         #get true pose from mocap (replaces robot.get_pose() in simulator)
@@ -260,16 +506,14 @@ class dbastarControllerNode(Node):
 
         self.reached = goal_reached(pose_true, self.goal, self.thr, float(self.problem["dbastar"]["goal_error_tolerance"]))
         # stop if goal reached or max iterations reached
-        if self.reached or self.i > self.steps_max:
-            cmd = Vector3()
-            self.cmd_pub.publish(cmd)
+        if self.reached:
+            self.get_logger().info("Goal reached")
+            self.stop_robot()
+            return
 
-            cost_s = (len(self.traj) - 1) * self.dt if self.reached else None
-            controls = np.array(self.log_wheel_cmd)
-            self.get_logger().info(
-                f"reached: {self.reached}, cost_s: {cost_s}, "
-                f"search_time_s: {self.t_compute}, traj: {self.traj}, "
-                f"controls: {controls}, dt: {self.dt}"
+        if self.control_step >= self.steps_max:
+            self.get_logger().warn(
+                "Maximum control duration reached"
             )
             self.stop_robot()
             return
@@ -286,7 +530,19 @@ class dbastarControllerNode(Node):
         # wheel_est = (ur_hat, ul_hat)
 
         #compute control commands using estimated states, use mocap pose as "true" pose instead of estimating it
-        ref_state = self.setpoints[self.i]
+        # ref_state = self.setpoints[self.i]
+        elapsed_time = self.control_step * self.controller_dt
+        reference_index = int(
+            round(elapsed_time / self.trajectory_dt)
+        )
+        if reference_index >= len(self.setpoints):
+            self.get_logger().warn(
+                "Reference trajectory finished before reaching the goal"
+            )
+            self.stop_robot()
+            return
+        ref_state = self.setpoints[reference_index]
+        self.reference_index = reference_index
         ref_state_full = np.asarray([
             ref_state[0],  # x
             ref_state[1],  # y
@@ -298,7 +554,7 @@ class dbastarControllerNode(Node):
             0.0,     # ay
         ])
         ur_cmd, ul_cmd = self.controller.compute(ref_state_full, pose_true, self.wheel_speeds) # this time it should really be ur, ul :D
-        self.i +=1
+        self.control_step += 1
         
         #convert wheel speeds to (v, w) for publishing
         #TODO: is it maybe better to publish r & l for pololu?
@@ -306,7 +562,9 @@ class dbastarControllerNode(Node):
         L = self.robot_param['base_diameter']
         v = r * (ur_cmd + ul_cmd) / 2.0
         w = r * (ur_cmd - ul_cmd) / L
-        # self.get_logger().info(f'v={v:.3f}, w={w:.3f}')
+        self.get_logger().info(f'v={v:.3f}, w={w:.3f}')
+        self.get_logger().info(f'x={ref_state[0]:.3f}, y={ref_state[1]:.3f}, theta={ref_state[2]:.3f}')
+        self.get_logger().info(f'ur={ur_cmd:.3f}, ul={ul_cmd:.3f}')
 
         #publish control actions --> controller interface expects (v, w) and sends it to pololu like x box controller inputs
         cmd = Vector3()

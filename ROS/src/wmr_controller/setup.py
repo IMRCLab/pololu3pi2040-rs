@@ -100,12 +100,19 @@ def get_data_files():
                 data_files.append((install_path, file_list))
 
     # Add external/dbastar recursively
-    base_install_path = os.path.join('share', package_name, 'external/dbastar')
-    base_source_path = 'external/dbastar'
+    base_install_path = os.path.join('share', package_name, 'external/realtime-dbastar')
+    base_source_path = 'external/realtime-dbastar'
     if os.path.exists(base_source_path):
         for root, dirs, files in os.walk(base_source_path):
-            if 'venv' in root or '.git' in root or '__pycache__' in root:
-                continue
+            # These directories contain generated, machine-local, or stale
+            # files and must not become ROS package data.  Pruning dirs also
+            # prevents os.walk() from descending into them.
+            dirs[:] = [
+                directory for directory in dirs
+                if directory not in {
+                    '.git', '__pycache__', 'target', 'venv', '.venv', 'results'
+                }
+            ]
             # Get relative path from base source
             rel_path = os.path.relpath(root, base_source_path)
             if rel_path == '.':
@@ -113,7 +120,12 @@ def get_data_files():
             else:
                 install_path = os.path.join(base_install_path, rel_path)
                 
-            file_list = [os.path.join(root, f) for f in files if not f.endswith('.pyc')]
+            file_list = [
+                os.path.join(root, filename)
+                for filename in files
+                if not filename.endswith('.pyc')
+                and os.path.isfile(os.path.join(root, filename))
+            ]
             if file_list:
                 data_files.append((install_path, file_list))
     
@@ -136,9 +148,11 @@ setup(
         'console_scripts': [
             'wmr_controller_node = wmr_controller.wmr_controller_node:main',
             'mpc_controller_node = wmr_controller.mpc_controller_node:main',
+            'dbastar_controller_node = wmr_controller.dbastar_controller_node:main',
             'reference_publisher_node = wmr_controller.reference_publisher_example:main',
             'timing_monitor = wmr_controller.timing_monitor:main',
             'rl_controller_node = wmr_controller.rl_controller_node:main',
+            'obstacle_monitor = wmr_controller.obstacle_monitor:main',
         ],
     },
 )
