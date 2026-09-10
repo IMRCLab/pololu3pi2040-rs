@@ -19,7 +19,6 @@ import os
 import time
 import glob
 import yaml
-BENCHMARK_FILE = "/home/lndw/wmr-ros/ROS/src/wmr_controller/external/realtime-dbastar/baselines/wmr-simulator/problems/benchmark/benchmark.yaml"
 venv_pattern = os.path.expanduser('~/wmr-ros/ROS/.venv/lib/python3.*/site-packages')
 venv_matches = glob.glob(venv_pattern)
 if venv_matches:
@@ -237,7 +236,7 @@ class dbastarControllerNode(Node):
         
         self.control_step = 0
         self.reference_index = 0
-
+        self.pose_predicted = [None, None] # predicted next pose based on current pose and control command
         #init estimator from wmr-simulator
         estimator_cfg = {
             "type": "dr",  # Dead reckoning for now (or "kf" for Kalman filter)
@@ -344,6 +343,7 @@ class dbastarControllerNode(Node):
                         self.request_replan()
                 break
 
+
     def current_robot_pose(self):
         if self.latest_pose is None:
             return None
@@ -444,7 +444,7 @@ class dbastarControllerNode(Node):
         self.controller.il = 0.0
         self.wheel_speeds = (0.0, 0.0)
         self.cmd_pub.publish(Vector3())
-
+        self.pose_predicted = [None, None]
         self.get_logger().info(
             f"Starting DBA* replan from {start} with "
             f"{len(problem['environment']['obstacles'])} AABBs"
@@ -563,10 +563,13 @@ class dbastarControllerNode(Node):
             0.0,     # ay
         ])
 
-        # trigger replan if shoved aka the robot is too far from the ref state (x,y)
-        if np.abs(x_true - ref_state[0]) >= 0.1 or np.abs(x_true - ref_state[0]) >= 0.1:
-            self.request_replan()
-            return
+        # trigger replan if shoved aka the predicted next state is too far away from the current state
+        if self.pose_predicted[0] is not None and self.pose_predicted[1] is not None:
+            dist = np.linalg.norm(np.array(pose_true[0:2]) - np.array(self.pose_predicted))
+            self.get_logger().info(f'Distance to predicted pose: {dist:.3f}')
+            if dist >= 0.15:
+                self.request_replan()
+                return
 
         ur_cmd, ul_cmd = self.controller.compute(ref_state_full, pose_true, self.wheel_speeds) # this time it should really be ur, ul :D
         self.control_step += 1
@@ -577,10 +580,11 @@ class dbastarControllerNode(Node):
         L = self.robot_param['base_diameter']
         v = r * (ur_cmd + ul_cmd) / 2.0
         w = r * (ur_cmd - ul_cmd) / L
-        self.get_logger().info(f'v={v:.3f}, w={w:.3f}')
-        self.get_logger().info(f'x={ref_state[0]:.3f}, y={ref_state[1]:.3f}, theta={ref_state[2]:.3f}')
-        self.get_logger().info(f'ur={ur_cmd:.3f}, ul={ul_cmd:.3f}')
+        # self.get_logger().info(f'v={v:.3f}, w={w:.3f}')
+        # self.get_logger().info(f'x={ref_state[0]:.3f}, y={ref_state[1]:.3f}, theta={ref_state[2]:.3f}')
+        # self.get_logger().info(f'ur={ur_cmd:.3f}, ul={ul_cmd:.3f}')
 
+        self.pose_predicted = pose_true[0:2] + np.array([v * np.cos(pose_true[2]), v * np.sin(pose_true[2])]) * self.controller_dt
         #publish control actions --> controller interface expects (v, w) and sends it to pololu like x box controller inputs
         cmd = Vector3()
         cmd.x = v
