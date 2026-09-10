@@ -33,6 +33,7 @@ import ament_index_python.packages
 try:
     package_share_directory = ament_index_python.packages.get_package_share_directory('wmr_controller')
     wmr_sim_path = os.path.join(package_share_directory, 'deps/wmr-simulator/scripts')
+
 except Exception:
     wmr_sim_path = None
 
@@ -49,22 +50,29 @@ if os.path.exists(wmr_sim_path):
 else:
     print(f"Error: Could not find wmr-simulator scripts at {wmr_sim_path}")
 
-mpc_path = None
+realtime_dbastar_path = None
+default_problem_path = None
 try:
     package_share_directory = ament_index_python.packages.get_package_share_directory('wmr_controller')
-    mpc_path = os.path.join(package_share_directory, 'external/realtime-dbastar/baselines/wmr-simulator/scripts')
+    realtime_dbastar_path = os.path.join(package_share_directory, 'external/realtime-dbastar/baselines/wmr-simulator/scripts')
+    default_problem_path = os.path.join(package_share_directory, 'external/realtime-dbastar/baselines/wmr-simulator/problems/benchmark/benchmark.yaml')
 except Exception:
     pass
 
-if not mpc_path or not os.path.exists(mpc_path):
-    mpc_path = os.path.join(os.path.dirname(__file__), '../external/realtime-dbastar/baselines/wmr-simulator/scripts')
+if not realtime_dbastar_path or not os.path.exists(realtime_dbastar_path):
+    realtime_dbastar_path = os.path.join(os.path.dirname(__file__), '../external/realtime-dbastar/baselines/wmr-simulator/scripts')
+if not default_problem_path or not os.path.exists(default_problem_path):
+    default_problem_path = os.path.join(os.path.dirname(__file__), '../external/realtime-dbastar/baselines/wmr-simulator/problems/benchmark/benchmark.yaml')
 
-if os.path.exists(mpc_path):
-    sys.path.insert(0, mpc_path)
+if not os.path.exists(default_problem_path):
+    print(f"Error: Could not find problem file at {default_problem_path}")
+
+if os.path.exists(realtime_dbastar_path):
+    sys.path.insert(0, realtime_dbastar_path)
     from benchmark import _deep_merge
-    from simulator import _run_smag_once, _smag_plan, goal_reached, obstacles_of, dynamic_obstacles_of, vanishing_obstacles_of, displacements_of, _mpc_sized_for, triggered, displacement_triggered, in_collision
+    from simulator import _run_smag_once, goal_reached, obstacles_of, dynamic_obstacles_of, vanishing_obstacles_of, displacements_of
 else:
-    print(f"Error: Could not find scripts at {mpc_path}")
+    print(f"Error: Could not find scripts at {realtime_dbastar_path}")
 
 
 class dbastarControllerNode(Node):
@@ -76,7 +84,7 @@ class dbastarControllerNode(Node):
         self.declare_parameter('mocap_topic', '/poses')
         self.declare_parameter('cmd_unicycle_topic', '/cmd_unicycle')
         self.declare_parameter('control_dt', 0.1)
-        self.declare_parameter('problem', BENCHMARK_FILE)
+        self.declare_parameter('problem', default_problem_path)
         self.declare_parameter('instance', '1.3_0.5_2.3562_empty')
         self.declare_parameter('obstacle_topic', '/obstacles_aabb')
         self.declare_parameter('obstacle_change_tolerance', 0.02)
@@ -157,6 +165,7 @@ class dbastarControllerNode(Node):
         self.traj = []
         self.log_wheel_cmd = []
 
+        # TODO remove planning here and plan as soon as the first mocap pose arrives?
         self.get_logger().info("Running planner once")
         result = _run_smag_once(
             self.problem,
@@ -505,7 +514,7 @@ class dbastarControllerNode(Node):
         self.traj.append(pose_true)
 
         self.reached = goal_reached(pose_true, self.goal, self.thr, float(self.problem["dbastar"]["goal_error_tolerance"]))
-        # stop if goal reached or max iterations reached
+        # stop if goal reached
         if self.reached:
             self.get_logger().info("Goal reached")
             self.stop_robot()
@@ -553,6 +562,12 @@ class dbastarControllerNode(Node):
             0.0,     # ax
             0.0,     # ay
         ])
+
+        # trigger replan if shoved aka the robot is too far from the ref state (x,y)
+        if np.abs(x_true - ref_state[0]) >= 0.1 or np.abs(x_true - ref_state[0]) >= 0.1:
+            self.request_replan()
+            return
+
         ur_cmd, ul_cmd = self.controller.compute(ref_state_full, pose_true, self.wheel_speeds) # this time it should really be ur, ul :D
         self.control_step += 1
         
