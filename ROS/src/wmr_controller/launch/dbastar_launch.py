@@ -61,6 +61,11 @@ def generate_launch_description():
             default_value='Obstacle01',
             description='Name of the obstacle in motion capture system'
         ),
+        DeclareLaunchArgument(
+            'displacement_thr',
+            default_value='0.1',
+            description='Difference between predicted and actual pose to trigger displacement replanning'
+        ),
         
         Node(
             package='wmr_controller',

@@ -87,6 +87,7 @@ class dbastarControllerNode(Node):
         self.declare_parameter('instance', '1.3_0.5_2.3562_empty')
         self.declare_parameter('obstacle_topic', '/obstacles_aabb')
         self.declare_parameter('obstacle_change_tolerance', 0.02)
+        self.declare_parameter('displacement_thr', 0.1)
 
         self.robot_name = str(self.get_parameter('robot_name').value)
         mocap_topic = str(self.get_parameter('mocap_topic').value)
@@ -98,6 +99,8 @@ class dbastarControllerNode(Node):
         self.obstacle_change_tolerance = float(
             self.get_parameter('obstacle_change_tolerance').value
         )
+        displacement_thr = float(self.get_parameter('displacement_thr').value)
+
         print(instance_name)
         if control_dt <= 0.0:
             raise ValueError("ROS parameter 'control_dt' must be greater than zero")
@@ -137,6 +140,18 @@ class dbastarControllerNode(Node):
                 "dbastar.dt must be greater than zero"
             )
         self.controller_dt = control_dt
+
+        if displacement_thr <= 0.0:
+            raise ValueError(
+                "displacement_thr distance must be absolute value"
+            )
+        self.displacement_thr = displacement_thr
+        self.recovering_from_displacement = False
+        self.still_count = 0
+        self.prev_pose_2d = None
+        self.pose_predicted = None # predicted next pose based on current pose and control command
+        self.disturbance_vec = np.array[0.0, 0.0]
+
         # if not np.isclose(self.controller_dt, self.trajectory_dt):
         #     self.get_logger().warn(
         #         f"control_dt={control_dt:g} Hz overrides dbastar.dt="
@@ -236,7 +251,6 @@ class dbastarControllerNode(Node):
         
         self.control_step = 0
         self.reference_index = 0
-        self.pose_predicted = [None, None] # predicted next pose based on current pose and control command
         #init estimator from wmr-simulator
         estimator_cfg = {
             "type": "dr",  # Dead reckoning for now (or "kf" for Kalman filter)
@@ -444,7 +458,7 @@ class dbastarControllerNode(Node):
         self.controller.il = 0.0
         self.wheel_speeds = (0.0, 0.0)
         self.cmd_pub.publish(Vector3())
-        self.pose_predicted = [None, None]
+        self.pose_predicted = None
         self.get_logger().info(
             f"Starting DBA* replan from {start} with "
             f"{len(problem['environment']['obstacles'])} AABBs"
@@ -526,6 +540,35 @@ class dbastarControllerNode(Node):
             )
             self.stop_robot()
             return
+
+        pose_true_2d = np.array(pose_true[0:2])
+        if self.recovering_from_displacement:
+            current_vel = np.linalg.norm(pose_true_2d - self.prev_pose_2d) / self.controller_dt
+            if current_vel < 0.01:
+                self.still_count +=1
+            else: 
+                self.still_count = 0
+
+            if self.still_count >= 3:
+                self.get_logger().info('Robot settled, replanning')
+                self.recovering_from_displacement = False
+                self.request_replan()
+                return
+            self.prev_pose_2d = pose_true_2d
+
+        # trigger replan if shoved aka the predicted next state is too far away from the current state
+        if self.pose_predicted is not None:
+            step_error = pose_true_2d - self.pose_predicted
+            self.disturbance_vec = (0.85 * self.disturbance_vec) + step_error
+            dist = np.linalg.norm(self.disturbance_vec)
+            self.get_logger().info(f'Distance to predicted pose: {dist:.3f}')
+            if dist >= self.displacement_thr:
+                self.get_logger().info(f'Displacement detected. Waiting to settle')
+                self.recovering_from_displacement = True
+                self.still_count = 0
+                self.prev_pose_2d = pose_true_2d
+                self.cmd_pub.publish(Vector3())
+                return
         
         #get true wheel speeds (in simulator: robot.get_wheel_speeds())
         #TODO: get robot log data eventually to use encoder readings for real wheel speeds
@@ -563,14 +606,6 @@ class dbastarControllerNode(Node):
             0.0,     # ay
         ])
 
-        # trigger replan if shoved aka the predicted next state is too far away from the current state
-        if self.pose_predicted[0] is not None and self.pose_predicted[1] is not None:
-            dist = np.linalg.norm(np.array(pose_true[0:2]) - np.array(self.pose_predicted))
-            self.get_logger().info(f'Distance to predicted pose: {dist:.3f}')
-            if dist >= 0.15:
-                self.request_replan()
-                return
-
         ur_cmd, ul_cmd = self.controller.compute(ref_state_full, pose_true, self.wheel_speeds) # this time it should really be ur, ul :D
         self.control_step += 1
         
@@ -584,7 +619,7 @@ class dbastarControllerNode(Node):
         # self.get_logger().info(f'x={ref_state[0]:.3f}, y={ref_state[1]:.3f}, theta={ref_state[2]:.3f}')
         # self.get_logger().info(f'ur={ur_cmd:.3f}, ul={ul_cmd:.3f}')
 
-        self.pose_predicted = pose_true[0:2] + np.array([v * np.cos(pose_true[2]), v * np.sin(pose_true[2])]) * self.controller_dt
+        self.pose_predicted = pose_true_2d + np.array([v * np.cos(pose_true[2]), v * np.sin(pose_true[2])]) * self.controller_dt
         #publish control actions --> controller interface expects (v, w) and sends it to pololu like x box controller inputs
         cmd = Vector3()
         cmd.x = v
