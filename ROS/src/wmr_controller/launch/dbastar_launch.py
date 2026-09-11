@@ -63,7 +63,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'displacement_thr',
-            default_value='0.1',
+            default_value='0.2',
             description='Difference between predicted and actual pose to trigger displacement replanning'
         ),
         
@@ -84,6 +84,9 @@ def generate_launch_description():
                 'obstacle_topic': LaunchConfiguration('obstacle_topic'),
                 'obstacle_change_tolerance': ParameterValue(
                     LaunchConfiguration('obstacle_change_tolerance'), value_type=float
+                ),
+                'displacement_thr': ParameterValue(
+                    LaunchConfiguration('displacement_thr'), value_type=float
                 ),
             }]
         ),

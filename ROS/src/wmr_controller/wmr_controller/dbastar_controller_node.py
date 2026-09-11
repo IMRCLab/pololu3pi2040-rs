@@ -101,7 +101,6 @@ class dbastarControllerNode(Node):
         )
         displacement_thr = float(self.get_parameter('displacement_thr').value)
 
-        print(instance_name)
         if control_dt <= 0.0:
             raise ValueError("ROS parameter 'control_dt' must be greater than zero")
         if not os.path.isfile(problem_path):
@@ -150,7 +149,7 @@ class dbastarControllerNode(Node):
         self.still_count = 0
         self.prev_pose_2d = None
         self.pose_predicted = None # predicted next pose based on current pose and control command
-        self.disturbance_vec = np.array[0.0, 0.0]
+        self.disturbance_vec = np.array([0.0, 0.0])
 
         # if not np.isclose(self.controller_dt, self.trajectory_dt):
         #     self.get_logger().warn(
@@ -555,19 +554,21 @@ class dbastarControllerNode(Node):
                 self.request_replan()
                 return
             self.prev_pose_2d = pose_true_2d
+            return
 
         # trigger replan if shoved aka the predicted next state is too far away from the current state
         if self.pose_predicted is not None:
             step_error = pose_true_2d - self.pose_predicted
-            self.disturbance_vec = (0.85 * self.disturbance_vec) + step_error
+            self.disturbance_vec = (0.5 * self.disturbance_vec) + step_error
             dist = np.linalg.norm(self.disturbance_vec)
             self.get_logger().info(f'Distance to predicted pose: {dist:.3f}')
             if dist >= self.displacement_thr:
                 self.get_logger().info(f'Displacement detected. Waiting to settle')
+                self.cmd_pub.publish(Vector3())
+                self.disturbance_vec = np.array([0.0, 0.0]) #reset error
                 self.recovering_from_displacement = True
                 self.still_count = 0
                 self.prev_pose_2d = pose_true_2d
-                self.cmd_pub.publish(Vector3())
                 return
         
         #get true wheel speeds (in simulator: robot.get_wheel_speeds())
